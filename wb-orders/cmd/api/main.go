@@ -3,30 +3,93 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/joho/godotenv"
+
+	"wb-orders/internal/cache"
+	ikafka "wb-orders/internal/kafka"
+	"wb-orders/internal/storage"
 )
 
-func main() {
-	// 1) Подключение к БД
-	dsn := "host=127.0.0.1 port=5433 dbname=wb_orders user=wb_user password=wb_pass sslmode=disable"
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func mustOpenDB() *sql.DB {
+	const dsn = "host=127.0.0.1 port=5433 dbname=wb_orders user=wb_user password=wb_pass sslmode=disable"
+
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		log.Fatal("open db:", err)
 	}
-	defer db.Close()
 
-	if err := db.Ping(); err != nil {
-		log.Fatal("ping db:", err)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var lastErr error
+	for attempt := 1; ; attempt++ {
+		if err = db.PingContext(ctx); err == nil {
+			return db
+		}
+		lastErr = err
+		wait := time.Duration(attempt) * time.Second
+		log.Printf("db not ready (attempt %d): %v — retry in %v", attempt, err, wait)
+
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			log.Fatalf("ping db: %v", lastErr)
+		}
 	}
-	fmt.Println("Connected to Postgres")
+}
 
-	// 2) Роутер
+func main() {
+	if err := godotenv.Load(".env"); err != nil {
+		log.Printf(".env not loaded: %v (ok if vars set by shell/docker)", err)
+	}
+
+	// 1) Подключение к БД и репозиторий
+	db := mustOpenDB()
+	defer db.Close()
+	fmt.Println("Connected to Postgres")
+	repo := storage.New(db)
+
+	// 2) Кэш (LRU на 1000 заказов)
+	orderCache := cache.NewLRU(1000)
+
+	// 2.1) Прогрев кэша последними 100 заказами
+	if err := warmUpCache(context.Background(), repo, orderCache, 100); err != nil {
+		log.Printf("cache warm-up error: %v", err)
+	}
+
+	// 3) Контекст для graceful shutdown
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// 4) Kafka consumer
+	cons := ikafka.NewConsumer()
+	defer cons.Close()
+
+	go func() {
+		if err := cons.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("kafka consumer stopped: %v", err)
+		}
+	}()
+
+	// 5) Роутер
 	mux := http.NewServeMux()
 
 	// healthcheck
@@ -36,77 +99,101 @@ func main() {
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	// /order/<id>
+	// debug: статистика кэша
+	mux.HandleFunc("/debug/cache", func(w http.ResponseWriter, r *http.Request) {
+		hits, misses := orderCache.Stats()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"len":    orderCache.Len(),
+			"hits":   hits,
+			"misses": misses,
+		})
+	})
+
+	// GET /order/{id}
 	mux.HandleFunc("/order/", func(w http.ResponseWriter, r *http.Request) {
 		id := strings.TrimPrefix(r.URL.Path, "/order/")
 		if id == "" {
-			http.Error(w, "missing order_uid", http.StatusBadRequest)
+			http.Error(w, "missing order id", http.StatusBadRequest)
 			return
 		}
 
-		// небольшой таймаут на запрос к БД
+		// 1) Кэш
+		if o, ok := orderCache.Get(id); ok {
+			log.Printf("cache HIT id=%s len=%d", id, orderCache.Len())
+			writeJSON(w, http.StatusOK, o)
+			return
+		}
+		log.Printf("cache MISS id=%s", id)
+
+		// 2) БД с таймаутом
 		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 		defer cancel()
 
-		const q = `
-		select jsonb_build_object(
-		'order_uid', o.order_uid,
-		'track_number', o.track_number,
-		'entry', o.entry,
-		'delivery', jsonb_build_object(
-			'name', d.name, 'phone', d.phone, 'zip', d.zip,
-			'city', d.city, 'address', d.address, 'region', d.region, 'email', d.email
-		),
-		'payment', jsonb_build_object(
-			'transaction', p.transaction, 'request_id', p.request_id, 'currency', p.currency,
-			'provider', p.provider, 'amount', p.amount, 'payment_dt', p.payment_dt,
-			'bank', p.bank, 'delivery_cost', p.delivery_cost, 'goods_total', p.goods_total, 'custom_fee', p.custom_fee
-		),
-		'items', coalesce(
-			jsonb_agg(jsonb_build_object(
-			'chrt_id', i.chrt_id, 'track_number', i.track_number, 'price', i.price,
-			'rid', i.rid, 'name', i.name, 'sale', i.sale, 'size', i.size,
-			'total_price', i.total_price, 'nm_id', i.nm_id, 'brand', i.brand, 'status', i.status
-			)) filter (where i.id is not null),
-			'[]'::jsonb
-		),
-		'locale', o.locale,
-		'internal_signature', o.internal_signature,
-		'customer_id', o.customer_id,
-		'delivery_service', o.delivery_service,
-		'shardkey', o.shardkey,
-		'sm_id', o.sm_id,
-		'date_created', to_char(o.date_created, 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
-		'oof_shard', o.oof_shard
-		) as order_json
-		from orders o
-		left join delivery d on d.order_uid = o.order_uid
-		left join payment  p on p.order_uid = o.order_uid
-		left join items    i on i.order_uid = o.order_uid
-		where o.order_uid = $1
-		group by
-		o.order_uid, o.track_number, o.entry, o.locale, o.internal_signature,
-		o.customer_id, o.delivery_service, o.shardkey, o.sm_id, o.date_created, o.oof_shard,
-		d.name, d.phone, d.zip, d.city, d.address, d.region, d.email,
-		p.transaction, p.request_id, p.currency, p.provider, p.amount, p.payment_dt, p.bank, p.delivery_cost, p.goods_total, p.custom_fee;`
-
-		var body []byte
-		err := db.QueryRowContext(ctx, q, id).Scan(&body)
-		if err == sql.ErrNoRows {
-			http.Error(w, "order not found", http.StatusNotFound)
-			return
-		}
+		o, err := repo.GetOrderByID(ctx, id)
 		if err != nil {
-			http.Error(w, "db error: "+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "not found or db error: "+err.Error(), http.StatusNotFound)
 			return
 		}
 
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(body)
+		// 3) Кладём в кэш и отдаём
+		orderCache.Set(id, o)
+		writeJSON(w, http.StatusOK, o)
 	})
 
+	// HTTP сервер с graceful shutdown
 	addr := ":8081"
-	fmt.Println("HTTP server listening on", addr)
-	log.Fatal(http.ListenAndServe(addr, mux))
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: mux,
+	}
+
+	go func() {
+		log.Printf("HTTP server listening on %s", addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("http server error: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+	log.Println("shutdown signal received")
+
+	shCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shCtx); err != nil {
+		log.Printf("http shutdown error: %v", err)
+	}
+	log.Println("bye")
+}
+
+// Прогрев кэша: загружаем последние N заказов
+func warmUpCache(ctx context.Context, repo *storage.Repo, c *cache.LRU, n int) error {
+	const q = `SELECT order_uid FROM orders ORDER BY date_created DESC LIMIT $1`
+	rows, err := repo.DB.QueryContext(ctx, q, n)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	ids := make([]string, 0, n)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, id := range ids {
+		o, err := repo.GetOrderByID(ctx, id)
+		if err != nil {
+			log.Printf("warm-up skip id=%s: %v", id, err)
+			continue
+		}
+		c.Set(id, o)
+	}
+	log.Printf("cache warm-up done: loaded=%d current_len=%d", len(ids), c.Len())
+	return nil
 }
