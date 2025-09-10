@@ -92,6 +92,10 @@ func main() {
 	// 5) Роутер
 	mux := http.NewServeMux()
 
+	// раздача статики (index.html и прочее из ./static)
+	fs := http.FileServer(http.Dir("./web"))
+	mux.Handle("/", fs)
+
 	// healthcheck
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
