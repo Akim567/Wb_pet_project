@@ -1,11 +1,23 @@
 package models
 
+import "time"
+
 // Order — главный объект, который будет возвращаться из БД и API.
 type Order struct {
-	ID       string   `json:"id"`
-	Delivery Delivery `json:"delivery"`
-	Payment  Payment  `json:"payment"`
-	Items    []Item   `json:"items"`
+	OrderUID          string    `json:"order_uid"`
+	TrackNumber       string    `json:"track_number"`
+	Entry             string    `json:"entry"`
+	Delivery          Delivery  `json:"delivery"`
+	Payment           Payment   `json:"payment"`
+	Items             []Item    `json:"items"`
+	Locale            string    `json:"locale"`
+	InternalSignature string    `json:"internal_signature"`
+	CustomerID        string    `json:"customer_id"`
+	DeliveryService   string    `json:"delivery_service"`
+	ShardKey          string    `json:"shardkey"`
+	SmID              int       `json:"sm_id"`
+	DateCreated       time.Time `json:"date_created"` // JSON приходит как RFC3339: "2021-11-26T06:22:19Z"
+	OofShard          string    `json:"oof_shard"`
 }
 
 // Delivery — данные о доставке.
@@ -26,7 +38,7 @@ type Payment struct {
 	Currency     string `json:"currency"`
 	Provider     string `json:"provider"`
 	Amount       int    `json:"amount"`
-	PaymentDT    int    `json:"payment_dt"`
+	PaymentDT    int64  `json:"payment_dt"`
 	Bank         string `json:"bank"`
 	DeliveryCost int    `json:"delivery_cost"`
 	GoodsTotal   int    `json:"goods_total"`

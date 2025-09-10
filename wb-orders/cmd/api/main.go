@@ -80,7 +80,7 @@ func main() {
 	defer stop()
 
 	// 4) Kafka consumer
-	cons := ikafka.NewConsumer()
+	cons := ikafka.NewConsumer(repo, orderCache)
 	defer cons.Close()
 
 	go func() {
