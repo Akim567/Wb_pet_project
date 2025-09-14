@@ -19,7 +19,7 @@ import (
 type Consumer struct {
 	reader *kafka.Reader
 	repo   *storage.Repo
-	cache  *cache.LRU // твой LRU или map-based кэш
+	cache  *cache.LRU
 }
 
 // Теперь создаём Consumer с зависимостями

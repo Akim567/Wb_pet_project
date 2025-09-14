@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 
-	// pgx как драйвер для database/sql
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"wb-orders/internal/models"
@@ -101,7 +100,6 @@ func (r *Repo) UpsertOrder(ctx context.Context, o models.Order) error {
 		}
 	}()
 
-	// ----- 1) orders (вставляем все нужные NOT NULL поля)
 	{
 		const q = `
 			INSERT INTO orders (
@@ -139,7 +137,7 @@ func (r *Repo) UpsertOrder(ctx context.Context, o models.Order) error {
 			o.DeliveryService,
 			o.ShardKey,
 			o.SmID,
-			o.DateCreated, // time.Time -> timestamp/timestamptz
+			o.DateCreated,
 			o.OofShard,
 		); err != nil {
 			_ = tx.Rollback()
@@ -244,6 +242,5 @@ func ValidateOrder(o models.Order) error {
 		return errors.New("empty date_created")
 	}
 
-	// Добавляй доп. проверки по необходимости
 	return nil
 }

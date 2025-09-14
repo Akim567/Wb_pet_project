@@ -16,7 +16,7 @@ type Order struct {
 	DeliveryService   string    `json:"delivery_service"`
 	ShardKey          string    `json:"shardkey"`
 	SmID              int       `json:"sm_id"`
-	DateCreated       time.Time `json:"date_created"` // JSON приходит как RFC3339: "2021-11-26T06:22:19Z"
+	DateCreated       time.Time `json:"date_created"`
 	OofShard          string    `json:"oof_shard"`
 }
 

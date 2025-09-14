@@ -16,14 +16,14 @@ type V = models.Order
 type entry struct {
 	key   K
 	value V
-	atime time.Time // последний доступ — пригодится для метрик/отладки
+	atime time.Time // последний доступ
 }
 
 type LRU struct {
 	mu       sync.RWMutex
 	capacity int
-	ll       *list.List          // список от свежего (Front) к старому (Back)
-	index    map[K]*list.Element // key -> элемент списка (*entry в e.Value)
+	ll       *list.List
+	index    map[K]*list.Element
 	hits     uint64
 	misses   uint64
 }
@@ -67,12 +67,10 @@ func (c *LRU) Set(key K, val V) {
 		return
 	}
 
-	// вставляем новый
 	en := &entry{key: key, value: val, atime: time.Now()}
 	el := c.ll.PushFront(en)
 	c.index[key] = el
 
-	// вытеснение
 	if c.ll.Len() > c.capacity {
 		tail := c.ll.Back()
 		if tail != nil {
